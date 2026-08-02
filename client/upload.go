@@ -673,6 +673,10 @@ func (c *Client) PushPaths(ctx context.Context, paths []string) ([]string, error
 
 	cachedPaths := len(pathInfos) - newPaths
 
+	if c.Progress != nil {
+		c.Progress.SetTotal(newPaths)
+	}
+
 	slog.Info(fmt.Sprintf("Uploading %d paths to %s (%d already cached)", newPaths, c.baseURL.Hostname(), cachedPaths))
 	slog.Debug("Need to upload objects", "pending", len(pendingObjects), "closures", len(pendingByClosureID))
 

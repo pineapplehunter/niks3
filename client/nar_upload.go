@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -31,7 +30,7 @@ var zstdEncoderPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool should b
 // compressAndSimpleUploadNAR uploads a small NAR with a single presigned PUT.
 // The compressed NAR is stored as opaque bytes with no Content-Encoding (like multipart part upload);
 // nix-daemon decompresses it per the narinfo Compression field.
-func (c *Client) compressAndSimpleUploadNAR(ctx context.Context, storePath, presignedURL, objectKey string, onListing func(*NarListing)) error {
+func (c *Client) compressAndSimpleUploadNAR(ctx context.Context, storePath, presignedURL, objectKey string, onListing func(*NarListing), task UploadProgressTask) error {
 	encoder, ok := zstdEncoderPool.Get().(*zstd.Encoder)
 	if !ok {
 		return errors.New("failed to get zstd encoder from pool")
@@ -41,8 +40,11 @@ func (c *Client) compressAndSimpleUploadNAR(ctx context.Context, storePath, pres
 	var buf bytes.Buffer
 
 	encoder.Reset(&buf)
+	writer := &progressWriter{contextErr: ctx.Err, writer: encoder, task: task}
 
-	listing, err := DumpPathWithListing(encoder, storePath)
+	listing, err := DumpPathWithListing(writer, storePath)
+	writer.Flush()
+
 	if err != nil {
 		return fmt.Errorf("serializing NAR: %w", err)
 	}
@@ -65,16 +67,22 @@ func (c *Client) compressAndSimpleUploadNAR(ctx context.Context, storePath, pres
 // onListing gets the directory listing as soon as serialization finishes,
 // while the NAR is still uploading; it must not block.
 func (c *Client) CompressAndUploadNAR(ctx context.Context, storePath string, narSize uint64, obj PendingObject, objectKey string, onListing func(*NarListing)) error {
-	name := filepath.Base(storePath)
+	name := packageName(storePath)
 	slog.Info(fmt.Sprintf("Uploading %s (%s)", name, formatBytes(narSize)))
+
+	var task UploadProgressTask = noopProgressTask{}
+	if c.Progress != nil {
+		task = c.Progress.Start(name, narSize)
+	}
+	defer task.Complete()
 
 	var err error
 
 	if obj.MultipartInfo != nil {
 		// The server records the object when the multipart upload completes.
-		err = c.compressAndMultipartUploadNAR(ctx, storePath, narSize, obj.MultipartInfo, objectKey, onListing)
+		err = c.compressAndMultipartUploadNAR(ctx, storePath, narSize, obj.MultipartInfo, objectKey, onListing, task)
 	} else {
-		err = c.compressAndSimpleUploadNAR(ctx, storePath, obj.PresignedURL, objectKey, onListing)
+		err = c.compressAndSimpleUploadNAR(ctx, storePath, obj.PresignedURL, objectKey, onListing, task)
 		if err == nil {
 			c.RegisterUploadedObject(ctx, objectKey)
 		}
@@ -90,7 +98,7 @@ func (c *Client) CompressAndUploadNAR(ctx context.Context, storePath string, nar
 }
 
 // compressAndMultipartUploadNAR streams a compressed NAR through a multipart upload.
-func (c *Client) compressAndMultipartUploadNAR(ctx context.Context, storePath string, narSize uint64, multipartInfo *MultipartUploadInfo, objectKey string, onListing func(*NarListing)) error {
+func (c *Client) compressAndMultipartUploadNAR(ctx context.Context, storePath string, narSize uint64, multipartInfo *MultipartUploadInfo, objectKey string, onListing func(*NarListing), task UploadProgressTask) error {
 	// Create a pipe for streaming: NAR serialization -> zstd compression -> hash/size tracking
 	pr, pw := io.Pipe()
 
@@ -117,6 +125,7 @@ func (c *Client) compressAndMultipartUploadNAR(ctx context.Context, storePath st
 		defer zstdEncoderPool.Put(encoder)
 
 		encoder.Reset(pw)
+		writer := &progressWriter{contextErr: ctx.Err, writer: encoder, task: task}
 
 		defer func() {
 			if err := encoder.Close(); err != nil {
@@ -125,7 +134,9 @@ func (c *Client) compressAndMultipartUploadNAR(ctx context.Context, storePath st
 		}()
 
 		// Serialize NAR with listing directly to the compressed stream
-		listing, err := DumpPathWithListing(encoder, storePath)
+		listing, err := DumpPathWithListing(writer, storePath)
+		writer.Flush()
+
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("serializing NAR: %w", err))
 

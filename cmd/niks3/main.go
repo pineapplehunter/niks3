@@ -61,6 +61,8 @@ func printPushHelp() {
 	fmt.Fprintln(os.Stderr, "        Maximum concurrent uploads (default: 30)")
 	fmt.Fprintln(os.Stderr, "  --verify-s3-integrity")
 	fmt.Fprintln(os.Stderr, "        Verify that objects in database actually exist in S3 before skipping upload")
+	fmt.Fprintln(os.Stderr, "  --output string")
+	fmt.Fprintln(os.Stderr, "        Output style: auto, log, or progress (default: auto)")
 	fmt.Fprintln(os.Stderr, cmdutil.TLSHelp)
 	fmt.Fprintln(os.Stderr, "  --debug")
 	fmt.Fprintln(os.Stderr, "        Enable debug logging (includes HTTP requests/responses)")
@@ -115,6 +117,7 @@ func run() error {
 		batchSize := pushCmd.Int("batch-size", client.DefaultStreamBatchSize, "Max paths per push with --stdin")
 		parallelPushes := pushCmd.Int("parallel-pushes", client.DefaultStreamParallel, "Concurrent pushes with --stdin")
 		retryTimeout := pushCmd.Duration("retry-timeout", 0, "Keep retrying a failing request for this long with --stdin")
+		output := pushCmd.String("output", string(outputAuto), "Output style: auto, log, or progress")
 		tf := cmdutil.AddTLSFlags(pushCmd)
 
 		ts, err := cmdutil.ParseCommand(pushCmd, cf, tf, os.Args[2:], printPushHelp)
@@ -140,7 +143,12 @@ func run() error {
 			return errors.New("--pin requires exactly one store path")
 		}
 
-		return pushCommand(*cf.ServerURL, ts, paths, *maxConcurrent, *verifyS3Integrity, *pinName, *cf.Debug, tf)
+		mode, err := selectOutputMode(*output, stderrIsTerminal())
+		if err != nil {
+			return err
+		}
+
+		return pushCommand(*cf.ServerURL, ts, paths, *maxConcurrent, *verifyS3Integrity, *pinName, mode, *cf.Debug, tf)
 
 	case "gc":
 		gcCmd := flag.NewFlagSet("gc", flag.ContinueOnError)
@@ -203,9 +211,27 @@ func run() error {
 	}
 }
 
-func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxConcurrent int, verifyS3Integrity bool, pinName string, debug bool, tf cmdutil.TLSFlags) error {
+func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxConcurrent int, verifyS3Integrity bool, pinName string, mode outputMode, debug bool, tf cmdutil.TLSFlags) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// NotifyContext consumes matching signals until stop is called. Restore
+	// the default handling after the first signal so a second Ctrl-C always
+	// terminates immediately, even if a dependency is slow to honor ctx.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
+	var display *progressDisplay
+	if mode == outputProgress {
+		display = newProgressDisplay(os.Stderr)
+		oldLogger := slog.Default()
+
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+		defer slog.SetDefault(oldLogger)
+		defer display.Wait()
+	}
 
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
@@ -220,6 +246,10 @@ func pushCommand(serverURL string, ts client.TokenSource, paths []string, maxCon
 	c.VerifyS3Integrity = verifyS3Integrity
 
 	defer c.WaitRegistrations()
+
+	if display != nil {
+		c.Progress = display
+	}
 
 	if _, err := c.PushPaths(ctx, paths); err != nil {
 		return fmt.Errorf("pushing paths: %w", err)

@@ -47,6 +47,7 @@ type Client struct {
 	cacheConfigMu           sync.Mutex
 	cacheConfig             *api.CacheConfig
 	cacheConfigAt           time.Time
+	Progress                UploadProgress // Optional parallel upload progress display
 }
 
 // loggingTransport wraps an http.RoundTripper to log requests and responses.
